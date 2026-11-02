@@ -19,18 +19,25 @@ parser.add_argument("--plugin", required=True)
 parser.add_argument("--launcher")
 OPTIONS, UNITTEST_ARGS = parser.parse_known_args()
 
+BIT_UNARY = {"bitNot", "popCount", "countLeadingZeros", "countTrailingZeros", "byteSwap"}
+BIT_BINARY = {"bitAnd", "bitOr", "bitXor"}
+BIT_INDEXED = {
+    "shiftLeft", "shiftRight", "shiftRightArithmetic", "rotateLeft", "rotateRight",
+    "testBit", "setBit", "clearBit", "toggleBit",
+}
+
 UNARY = {
     "abs", "sign", "sqrt", "cbrt", "exp", "exp2", "expm1", "log", "log2",
     "log10", "log1p", "sin", "cos", "tan", "asin", "acos", "atan", "sinh",
     "cosh", "tanh", "asinh", "acosh", "atanh", "radians", "degrees", "ceil",
     "floor", "trunc", "round", "frexp", "modf", "erf", "erfc", "gamma",
     "lgamma", "factorial", "isqrt", "sum", "product", "mean", "norm",
-}
+} | BIT_UNARY
 BINARY = {
     "add", "sub", "mul", "div", "min", "max", "pow", "hypot", "logBase",
     "atan2", "fmod", "remainder", "copysign", "nextAfter", "fdim", "ldexp",
     "isClose", "gcd", "lcm", "comb", "perm", "powInt", "mod", "dot",
-}
+} | BIT_BINARY | BIT_INDEXED
 TERNARY = {"clamp", "lerp", "fma", "isCloseWith"}
 CONSTANTS = {
     "pi": math.pi,
@@ -51,6 +58,9 @@ CONSTANTS = {
 
 def literal(value):
     """Parenthesize negatives so Nix parses applications rather than subtraction."""
+    # Nix parses unary minus separately and rejects the positive 2^63 literal.
+    if isinstance(value, int) and value == -(2 ** 63):
+        return "(-9223372036854775807 - 1)"
     return f"({json.dumps(value)})"
 
 
@@ -167,6 +177,15 @@ class PluginTests(unittest.TestCase):
             "sum": ("[ 1.0e16 1 (-1.0e16) ]", 1.0),
             "product": ("[ 2 3 4 ]", 24.0), "mean": ("[ 2 3 4 ]", 3.0),
             "norm": ("[ 3 4 12 ]", 13.0), "dot": ("[ 1 2 3 ] [ 4 5 6 ]", 32.0),
+            "bitAnd": ("12 10", 8), "bitOr": ("12 10", 14),
+            "bitXor": ("12 10", 6), "bitNot": ("0", -1),
+            "shiftLeft": ("3 4", 48), "shiftRight": ("(-1) 1", 2 ** 63 - 1),
+            "shiftRightArithmetic": ("(-8) 2", -2),
+            "rotateLeft": ("m.minInt 1", 1), "rotateRight": ("1 1", -(2 ** 63)),
+            "popCount": ("(-1)", 64), "countLeadingZeros": ("1", 63),
+            "countTrailingZeros": ("8", 3), "byteSwap": ("1", 2 ** 56),
+            "testBit": ("8 3", True), "setBit": ("0 63", -(2 ** 63)),
+            "clearBit": ("(-1) 63", 2 ** 63 - 1), "toggleBit": ("8 3", 0),
         }
         self.assertEqual(cases.keys(), UNARY | BINARY | TERNARY)
         self.assert_values([(f"m.{name} {args}", value) for name, (args, value) in cases.items()])
@@ -338,6 +357,97 @@ class PluginTests(unittest.TestCase):
             ])
         self.assert_values(cases)
 
+    def test_bit_boundaries(self):
+        self.assert_values([
+            ("m.bitNot m.minInt", 2 ** 63 - 1),
+            ("m.bitNot m.maxInt", -(2 ** 63)),
+            ("m.bitNot (-1)", 0),
+            ("m.bitAnd m.minInt m.maxInt", 0),
+            ("m.bitOr m.minInt m.maxInt", -1),
+            ("m.bitXor m.minInt (-1)", 2 ** 63 - 1),
+            ("m.shiftLeft 1 63", -(2 ** 63)),
+            ("m.shiftLeft m.minInt 1", 0),
+            ("m.shiftLeft (-1) 63", -(2 ** 63)),
+            ("m.shiftRight m.minInt 63", 1),
+            ("m.shiftRightArithmetic m.minInt 63", -1),
+            ("m.shiftRightArithmetic (-3) 1", -2),
+            ("m.rotateLeft m.minInt 1", 1),
+            ("m.rotateRight 1 1", -(2 ** 63)),
+            ("m.popCount 0", 0), ("m.popCount m.maxInt", 63),
+            ("m.popCount m.minInt", 1),
+            ("m.countLeadingZeros 0", 64), ("m.countTrailingZeros 0", 64),
+            ("m.countLeadingZeros (-1)", 0), ("m.countTrailingZeros (-1)", 0),
+            ("m.countLeadingZeros m.minInt", 0), ("m.countTrailingZeros m.minInt", 63),
+            ("m.byteSwap m.minInt", 128), ("m.byteSwap 128", -(2 ** 63)),
+            ("m.byteSwap (-1)", -1),
+            ("m.byteSwap 72623859790382856", 578437695752307201),
+            ("m.testBit m.minInt 63", True), ("m.testBit m.minInt 0", False),
+            ("m.setBit 0 0", 1), ("m.setBit m.minInt 63", -(2 ** 63)),
+            ("m.clearBit m.minInt 63", 0), ("m.clearBit 0 0", 0),
+            ("m.toggleBit m.minInt 63", 0), ("m.toggleBit 0 63", -(2 ** 63)),
+            ("(m.bitAnd 255) 511", 255),
+            ("builtins.typeOf (m.testBit 0 0)", "bool"),
+            ("builtins.typeOf (m.shiftLeft 1 63)", "int"),
+        ])
+
+    def test_bit_argument_validation(self):
+        for names, arity in [(BIT_UNARY, 1), (BIT_BINARY | BIT_INDEXED, 2)]:
+            for name in sorted(names):
+                for position in range(arity):
+                    for bad in ["1.0", "true", "null"]:
+                        args = ["1"] * arity
+                        args[position] = bad
+                        expression = f"m.{name} " + " ".join(args)
+                        with self.subTest(expression=expression):
+                            result = self.run_expression(expression)
+                            self.assertGreater(result.returncode, 0, result.stderr)
+                            self.assertIn("error:", result.stderr)
+        for name in sorted(BIT_INDEXED):
+            for bad in ["(-1)", "64", "m.minInt", "m.maxInt"]:
+                expression = f"m.{name} 1 {bad}"
+                with self.subTest(expression=expression):
+                    result = self.run_expression(expression)
+                    self.assertGreater(result.returncode, 0, result.stderr)
+                    self.assertIn("[0, 63]", result.stderr)
+
+    def test_randomized_bit_reference(self):
+        rng = random.Random(64)
+        mask = 2 ** 64 - 1
+
+        def signed(word):
+            word &= mask
+            return word - 2 ** 64 if word >= 2 ** 63 else word
+
+        cases = []
+        for count in range(64):
+            for x in [0, -1, -(2 ** 63), 2 ** 63 - 1, rng.randrange(-(2 ** 63), 2 ** 63)]:
+                y = rng.randrange(-(2 ** 63), 2 ** 63)
+                word = x & mask
+                a, b = literal(x), literal(y)
+                expected = {
+                    "bitAnd": (f"{a} {b}", signed(x & y)),
+                    "bitOr": (f"{a} {b}", signed(x | y)),
+                    "bitXor": (f"{a} {b}", signed(x ^ y)),
+                    "bitNot": (a, signed(~x)),
+                    "shiftLeft": (f"{a} {count}", signed(word << count)),
+                    "shiftRight": (f"{a} {count}", signed(word >> count)),
+                    "shiftRightArithmetic": (f"{a} {count}", x >> count),
+                    "rotateLeft": (f"{a} {count}", signed((word << count) | (word >> ((64 - count) % 64)))),
+                    "rotateRight": (f"{a} {count}", signed((word >> count) | (word << ((64 - count) % 64)))),
+                    "popCount": (a, word.bit_count()),
+                    "countLeadingZeros": (a, 64 - word.bit_length()),
+                    "countTrailingZeros": (a, (word & -word).bit_length() - 1 if word else 64),
+                    "byteSwap": (a, signed(int.from_bytes(word.to_bytes(8, "little"), "big"))),
+                    "testBit": (f"{a} {count}", bool(word & (1 << count))),
+                    "setBit": (f"{a} {count}", signed(word | (1 << count))),
+                    "clearBit": (f"{a} {count}", signed(word & ~(1 << count))),
+                    "toggleBit": (f"{a} {count}", signed(word ^ (1 << count))),
+                }
+                cases.extend((f"m.{name} {args}", value) for name, (args, value) in expected.items())
+        # Stay below the operating system's per-argument size limit.
+        for offset in range(0, len(cases), 256):
+            self.assert_values(cases[offset:offset + 256])
+
     def test_randomized_float_reference(self):
         rng = random.Random(42)
         cases = []
@@ -353,6 +463,7 @@ class PluginTests(unittest.TestCase):
 
     def test_pure_evaluation(self):
         self.assertEqual(self.evaluate("m.sqrt 81", modern=True), 9.0)
+        self.assertEqual(self.evaluate("m.shiftRight (-1) 1", modern=True), 2 ** 63 - 1)
 
     def test_allocation_stress(self):
         self.assertEqual(self.evaluate(
@@ -367,10 +478,13 @@ class PluginTests(unittest.TestCase):
         self.assertEqual(result["vectorLength"], 13.0)
         self.assertFalse(result["approximatelyEqual"])
         self.assertTrue(result["nearZero"])
+        self.assertEqual(result["flags"], -(2 ** 63) + 48)
+        self.assertEqual(result["setBits"], 64)
 
     @unittest.skipUnless(OPTIONS.launcher, "installed launcher not supplied")
     def test_installed_launcher(self):
         self.assertEqual(self.evaluate("m.powInt 2 10", launcher=True), 1024)
+        self.assertEqual(self.evaluate("m.rotateLeft 1 63", launcher=True), -(2 ** 63))
         result = self.run_expression("m.sqrt (-1)", launcher=True)
         self.assertGreater(result.returncode, 0)
         self.assertIn("mathnix:", result.stderr)

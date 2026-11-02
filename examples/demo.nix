@@ -12,4 +12,6 @@ in {
   decomposition = m.frexp 12;
   approximatelyEqual = m.isClose (m.sin m.pi) 0; # false without an absolute tolerance
   nearZero = m.isCloseWith { absTol = 1.0e-15; } (m.sin m.pi) 0;
+  flags = m.setBit (m.shiftLeft 3 4) 63;
+  setBits = m.popCount (-1);
 }

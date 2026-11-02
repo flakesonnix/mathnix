@@ -1,10 +1,10 @@
 # mathnix
 
-A native Nix evaluator plugin exposing **`builtins.math`**: 69 curried functions
+A native Nix evaluator plugin exposing **`builtins.math`**: 86 curried functions
 for real-valued arithmetic, transcendental and special functions, exact integer
-math, and list/vector reductions. No runtime dependencies beyond Nix and its C++
-runtime. All operations work in pure evaluation; nothing executes external
-programs, reads files, or uses randomness.
+math, 64-bit bit operations, and list/vector reductions. No runtime dependencies
+beyond Nix and its C++ runtime. All operations work in pure evaluation; nothing
+executes external programs, reads files, or uses randomness.
 
 ## Quick start
 
@@ -68,7 +68,8 @@ Parenthesize negative arguments: `m.cbrt (-8)`, not `m.cbrt -8` (subtraction).
   and the integer helpers return signed 64-bit integers. Rounding an integer
   preserves it exactly, including values above 2^53.
 - Integer helpers require actual integers, not integral floats. Overflow is an
-  error, never wrapping or silently converting to float.
+  error, never wrapping or silently converting to float. Bit operations instead
+  manipulate fixed-width words and deliberately discard bits shifted out.
 - Inputs and results must be finite. Invalid domains, poles, division by zero,
   and floating-point overflow raise Nix evaluation errors. Underflow may produce
   subnormal numbers or signed zero. There are intentionally no infinity/NaN
@@ -163,6 +164,42 @@ absolute tolerance for comparisons to zero.
 `gcd 0 0 = 0`; LCM is zero when either argument is zero. A nonnegative result
 equal to 2^63 is still overflow, even though -2^63 is a valid input.
 
+### Low-level bit operations
+
+All operands are **integers**, treated as 64-bit two's-complement bit patterns.
+Word results are returned as signed Nix integers: bit 63 is the sign bit, so
+`shiftLeft 1 63 = minInt` and `bitNot 0 = -1`. No floating-point conversion is
+involved, and left shifts discard overflow bits rather than raising overflow.
+Use `m.minInt` for -2^63: Nix's parser rejects the decimal literal
+`-9223372036854775808` because its positive magnitude is outside the integer range.
+Indices and counts must be integers in **[0, 63]**, including for rotations;
+negative counts and 64 are errors, not masked or reduced modulo 64. Bit 0 is
+the least significant bit. A count of zero preserves the input.
+
+| Function | Meaning |
+| --- | --- |
+| `bitAnd a b`, `bitOr a b`, `bitXor a b` | Bitwise AND, OR, XOR; same results as Nix's existing builtins |
+| `bitNot x` | Complement all 64 bits |
+| `shiftLeft x count` | Zero-fill left shift; discard high bits |
+| `shiftRight x count` | **Logical**, zero-fill right shift, including for negative x |
+| `shiftRightArithmetic x count` | **Arithmetic**, sign-extending right shift |
+| `rotateLeft x count`, `rotateRight x count` | Rotate a 64-bit word; shifted-out bits wrap around |
+| `popCount x` | Number of set bits, including the sign bit; `popCount (-1) = 64` |
+| `countLeadingZeros x`, `countTrailingZeros x` | Zero bits before the first set bit from the MSB/LSB; both return 64 for zero |
+| `byteSwap x` | Reverse all eight bytes, independent of host endianness |
+| `testBit x index` | Boolean: is the bit set? |
+| `setBit x index`, `clearBit x index`, `toggleBit x index` | Set, clear, or invert one bit; return the updated word |
+
+```nix
+let m = builtins.math; in {
+  flags = m.setBit (m.shiftLeft 3 4) 63; # -9223372036854775760
+  logical = m.shiftRight (-8) 2;       # 4611686018427387902
+  arithmetic = m.shiftRightArithmetic (-8) 2; # -2
+  rotated = m.rotateLeft m.minInt 1;   # 1
+  enabled = m.testBit 8 3;             # true
+}
+```
+
 ### Lists and vectors
 
 | Function | Meaning |
@@ -187,3 +224,5 @@ The derivation tests the compiled and installed libraries and the installed
 launcher. Tests cover every exported function, wrong types, invalid domains,
 64-bit boundaries, signed zero/subnormals, cancellation, overflow, pure eval,
 currying, allocation stress, and randomized comparisons to Python's math library.
+Bit tests also cover all 64 shift/rotation counts, negative word patterns,
+sign-bit boundaries, zero counts, endian conversion, and invalid argument ranges/types.

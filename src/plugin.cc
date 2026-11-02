@@ -2,6 +2,7 @@
 #include <nix/expr/primops.hh>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -43,6 +44,13 @@ struct Call {
         auto result = integer(value);
         if (result < 0) fail("expected a nonnegative integer");
         return result;
+    }
+
+    unsigned bitIndex(Value & value) const
+    {
+        Int result = integer(value);
+        if (result < 0 || result > 63) fail("bit index or count must be in [0, 63]");
+        return static_cast<unsigned>(result);
     }
 
     void result(double value, Value & out) const
@@ -334,6 +342,63 @@ void mod(EvalState & state, PosIdx pos, Value ** args, Value & out)
     out.mkInt(result < 0 ? result + modulus : result);
 }
 
+// Work on unsigned words, then reinterpret the result as Nix's signed integer.
+// In particular, left shifts must not use signed arithmetic or overflow checks.
+template<uint64_t (*Function)(uint64_t)>
+void wordUnary(EvalState & state, PosIdx pos, Value ** args, Value & out)
+{
+    Call call{state, pos};
+    auto x = static_cast<uint64_t>(call.integer(*args[0]));
+    out.mkInt(std::bit_cast<Int>(Function(x)));
+}
+
+template<uint64_t (*Function)(uint64_t, uint64_t)>
+void wordBinary(EvalState & state, PosIdx pos, Value ** args, Value & out)
+{
+    Call call{state, pos};
+    auto a = static_cast<uint64_t>(call.integer(*args[0]));
+    auto b = static_cast<uint64_t>(call.integer(*args[1]));
+    out.mkInt(std::bit_cast<Int>(Function(a, b)));
+}
+
+template<uint64_t (*Function)(uint64_t, unsigned)>
+void wordIndexed(EvalState & state, PosIdx pos, Value ** args, Value & out)
+{
+    Call call{state, pos};
+    auto x = static_cast<uint64_t>(call.integer(*args[0]));
+    unsigned index = call.bitIndex(*args[1]);
+    out.mkInt(std::bit_cast<Int>(Function(x, index)));
+}
+
+uint64_t bitAnd(uint64_t a, uint64_t b) { return a & b; }
+uint64_t bitOr(uint64_t a, uint64_t b) { return a | b; }
+uint64_t bitXor(uint64_t a, uint64_t b) { return a ^ b; }
+uint64_t bitNot(uint64_t x) { return ~x; }
+uint64_t shiftLeft(uint64_t x, unsigned count) { return x << count; }
+uint64_t shiftRight(uint64_t x, unsigned count) { return x >> count; }
+uint64_t shiftRightArithmetic(uint64_t x, unsigned count)
+{
+    // Since C++20, signed right shift is defined to sign-extend.
+    return std::bit_cast<uint64_t>(std::bit_cast<Int>(x) >> count);
+}
+uint64_t rotateLeft(uint64_t x, unsigned count) { return std::rotl(x, static_cast<int>(count)); }
+uint64_t rotateRight(uint64_t x, unsigned count) { return std::rotr(x, static_cast<int>(count)); }
+uint64_t popCount(uint64_t x) { return static_cast<uint64_t>(std::popcount(x)); }
+uint64_t countLeadingZeros(uint64_t x) { return static_cast<uint64_t>(std::countl_zero(x)); }
+uint64_t countTrailingZeros(uint64_t x) { return static_cast<uint64_t>(std::countr_zero(x)); }
+uint64_t byteSwap(uint64_t x) { return std::byteswap(x); }
+uint64_t setBit(uint64_t x, unsigned index) { return x | (uint64_t{1} << index); }
+uint64_t clearBit(uint64_t x, unsigned index) { return x & ~(uint64_t{1} << index); }
+uint64_t toggleBit(uint64_t x, unsigned index) { return x ^ (uint64_t{1} << index); }
+
+void testBit(EvalState & state, PosIdx pos, Value ** args, Value & out)
+{
+    Call call{state, pos};
+    auto x = static_cast<uint64_t>(call.integer(*args[0]));
+    unsigned index = call.bitIndex(*args[1]);
+    out.mkBool((x & (uint64_t{1} << index)) != 0);
+}
+
 // Neumaier compensated summation, widened to avoid double intermediate overflow.
 struct Accumulator {
     long double total = 0;
@@ -478,6 +543,23 @@ PrimOp functions[] = {
     CUSTOM("isqrt", isqrt, 1, "Exact floor of the square root of a nonnegative integer."),
     CUSTOM("powInt", powInt, 2, "Checked exact integer exponentiation; exponent must be nonnegative."),
     CUSTOM("mod", mod, 2, "Euclidean integer remainder mod x modulus; modulus > 0."),
+    CUSTOM("bitAnd", wordBinary<bitAnd>, 2, "Bitwise AND of two 64-bit integers."),
+    CUSTOM("bitOr", wordBinary<bitOr>, 2, "Bitwise OR of two 64-bit integers."),
+    CUSTOM("bitXor", wordBinary<bitXor>, 2, "Bitwise XOR of two 64-bit integers."),
+    CUSTOM("bitNot", wordUnary<bitNot>, 1, "Complement all 64 bits of an integer."),
+    CUSTOM("shiftLeft", wordIndexed<shiftLeft>, 2, "shiftLeft x count: zero-fill left shift, discarding overflow; count in [0, 63]."),
+    CUSTOM("shiftRight", wordIndexed<shiftRight>, 2, "shiftRight x count: logical (zero-fill) right shift; count in [0, 63]."),
+    CUSTOM("shiftRightArithmetic", wordIndexed<shiftRightArithmetic>, 2, "shiftRightArithmetic x count: sign-extending right shift; count in [0, 63]."),
+    CUSTOM("rotateLeft", wordIndexed<rotateLeft>, 2, "rotateLeft x count: rotate a 64-bit word left; count in [0, 63]."),
+    CUSTOM("rotateRight", wordIndexed<rotateRight>, 2, "rotateRight x count: rotate a 64-bit word right; count in [0, 63]."),
+    CUSTOM("popCount", wordUnary<popCount>, 1, "Count set bits in a 64-bit word, including the sign bit."),
+    CUSTOM("countLeadingZeros", wordUnary<countLeadingZeros>, 1, "Count leading zero bits; zero has 64."),
+    CUSTOM("countTrailingZeros", wordUnary<countTrailingZeros>, 1, "Count trailing zero bits; zero has 64."),
+    CUSTOM("byteSwap", wordUnary<byteSwap>, 1, "Reverse all eight bytes of a 64-bit word, independent of host endianness."),
+    CUSTOM("testBit", testBit, 2, "testBit x index: return whether bit index is set; index in [0, 63], least significant bit first."),
+    CUSTOM("setBit", wordIndexed<setBit>, 2, "setBit x index: set bit index; index in [0, 63]."),
+    CUSTOM("clearBit", wordIndexed<clearBit>, 2, "clearBit x index: clear bit index; index in [0, 63]."),
+    CUSTOM("toggleBit", wordIndexed<toggleBit>, 2, "toggleBit x index: invert bit index; index in [0, 63]."),
     CUSTOM("sum", sum<false>, 1, "Compensated floating-point sum of a list; sum [] = 0.0."),
     CUSTOM("product", product, 1, "Floating-point product of a list; product [] = 1.0."),
     CUSTOM("mean", sum<true>, 1, "Arithmetic mean of a nonempty list, avoiding intermediate sum overflow."),
