@@ -226,3 +226,12 @@ launcher. Tests cover every exported function, wrong types, invalid domains,
 currying, allocation stress, and randomized comparisons to Python's math library.
 Bit tests also cover all 64 shift/rotation counts, negative word patterns,
 sign-bit boundaries, zero counts, endian conversion, and invalid argument ranges/types.
+
+### Continuous integration
+
+GitHub Actions runs `nix flake check` on native x86_64 and aarch64 Ubuntu runners
+for pushes, pull requests, and manual runs. Each job evaluates all supported flake
+outputs, builds the plugin, runs the compiled/installed integration tests, and
+lints the workflow with `actionlint`. Actions are pinned to commit hashes and
+run with read-only repository permissions. The flake lock file is never updated
+by CI.

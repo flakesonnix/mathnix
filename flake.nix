@@ -20,9 +20,17 @@
           meta.description = "Run the matching Nix evaluator with mathnix loaded";
         };
       });
-      checks = eachSystem (system: {
-        integration = self.packages.${system}.mathnix;
-      });
+      checks = eachSystem (system:
+        let pkgs = import nixpkgs { inherit system; };
+        in {
+          integration = self.packages.${system}.mathnix;
+          workflow = pkgs.runCommand "mathnix-workflow-check" {
+            nativeBuildInputs = [ pkgs.actionlint ];
+          } ''
+            actionlint ${./.github/workflows/checks.yml}
+            touch "$out"
+          '';
+        });
       devShells = eachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
